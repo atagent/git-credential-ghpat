@@ -3,7 +3,8 @@
 //! up in a two-column map file and answers with the PAT, rewriting the
 //! username to "token" so the identifier never reaches GitHub.
 //!
-//! Map file ($GHPAT_FILE, default ~/.config/git/ghpat):
+//! Map file: $GHPAT_FILE, or credentials in the config directory (see
+//! get_ghpat_path):
 //!
 //!   # identifier  token
 //!   work          github_pat_AAAA...
@@ -26,22 +27,31 @@ fn env_nonempty(key: &str) -> Option<OsString> {
     env::var_os(key).filter(|value| !value.is_empty())
 }
 
-/// Git for Windows sets HOME for the processes it starts; USERPROFILE covers
-/// running the helper by hand.
-fn home_dir() -> Option<PathBuf> {
-    env_nonempty("HOME")
-        .or_else(|| cfg!(windows).then(|| env_nonempty("USERPROFILE")).flatten())
+/// An absolute directory from the environment. Relative values are ignored,
+/// as the XDG base directory spec requires.
+fn env_dir(key: &str) -> Option<PathBuf> {
+    env_nonempty(key)
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// $XDG_CONFIG_HOME, falling back to %APPDATA% on Windows and to
+/// $HOME/.config elsewhere.
+fn config_dir() -> Option<PathBuf> {
+    env_dir("XDG_CONFIG_HOME").or_else(|| {
+        if cfg!(windows) {
+            env_dir("APPDATA")
+        } else {
+            env_dir("HOME").map(|home| home.join(".config"))
+        }
+    })
 }
 
 fn get_ghpat_path() -> Option<PathBuf> {
     if let Some(path) = env_nonempty("GHPAT_FILE") {
         return Some(path.into());
     }
-    let config_home = env_nonempty("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home_dir().map(|home| home.join(".config")))?;
-    Some(config_home.join("git").join("ghpat"))
+    Some(config_dir()?.join(PROG).join("credentials"))
 }
 
 /// Return the username from git's key=value lines, up to the blank line that

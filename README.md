@@ -27,10 +27,14 @@ helper.
 
 The file is looked up in this order:
 
-1. `$GHPAT_FILE`
-2. `$XDG_CONFIG_HOME/git/ghpat`
-3. `~/.config/git/ghpat`. On Windows, `~` is `%USERPROFILE%`, so this is
-   `%USERPROFILE%\.config\git\ghpat`.
+| | Linux | Windows |
+|---|---|---|
+| 1 | `$GHPAT_FILE` | `%GHPAT_FILE%` |
+| 2 | `$XDG_CONFIG_HOME/git-credential-ghpat/credentials` | same |
+| 3 | `~/.config/git-credential-ghpat/credentials` | `%APPDATA%\git-credential-ghpat\credentials` |
+
+`XDG_CONFIG_HOME` is usually unset, so step 3 is the common case. A relative
+`XDG_CONFIG_HOME` is ignored, as the XDG spec requires.
 
 ```
 # identifier  token
@@ -40,16 +44,7 @@ side          github_pat_BBBB...
 
 - Each line has two columns separated by whitespace. Blank lines are ignored.
 - If an identifier is listed more than once, the **last** entry wins.
-- Windows line endings (CRLF) and a UTF-8 BOM are accepted, so a file saved
-  by Notepad works.
-- Keep it private, and don't commit it to a dotfiles repo. On Linux:
-
-  ```sh
-  mkdir -p -m 700 ~/.config/git
-  touch ~/.config/git/ghpat && chmod 600 ~/.config/git/ghpat
-  ```
-
-  On Windows, files under `%USERPROFILE%` are readable only by you by default.
+- Windows line endings (CRLF) and a UTF-8 BOM are accepted.
 
 ## Configure git
 
