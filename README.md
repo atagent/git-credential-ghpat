@@ -95,6 +95,9 @@ Windows, run it in Git Bash.
 cargo test
 ```
 
+CI runs clippy and the tests on Linux and Windows, and uploads release
+binaries for both as workflow artifacts.
+
 ## Behavior
 
 | Request | Result |
