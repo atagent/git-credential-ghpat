@@ -3,15 +3,16 @@
 A git credential helper for using several GitHub PATs with one account.
 
 Git's username for a request is used as an **identifier**. The helper looks
-it up in a map file and answers with that PAT, sending `token` as the
+it up in a credentials file and answers with that PAT, sending `token` as the
 username, so the identifier never reaches GitHub.
 
 ```
 git → username=work → ghpat → username=token, password=github_pat_…
 ```
 
-Works on Linux and Windows. It has no dependencies beyond the Rust standard
-library.
+Works on Linux and Windows. Its only dependency is
+[`rpassword`](https://crates.io/crates/rpassword), for reading a token
+without echoing it.
 
 ## Install
 
@@ -23,7 +24,7 @@ This installs `git-credential-ghpat` (`git-credential-ghpat.exe` on Windows)
 into `~/.cargo/bin`. That directory must be on your `PATH` so git can find the
 helper.
 
-## Map file
+## Credentials file
 
 The file is looked up in this order:
 
@@ -42,9 +43,35 @@ work          github_pat_AAAA...
 side          github_pat_BBBB...
 ```
 
-- Each line has two columns separated by whitespace. Blank lines are ignored.
+- Each line has two columns separated by whitespace. Blank lines and lines
+  starting with `#` are ignored.
 - If an identifier is listed more than once, the **last** entry wins.
 - Windows line endings (CRLF) and a UTF-8 BOM are accepted.
+
+## Manage tokens
+
+```sh
+git-credential-ghpat list-tokens       # print the names, never the tokens
+git-credential-ghpat set-token work    # add, or replace the entry in use
+git-credential-ghpat get-token work    # print the token
+git-credential-ghpat del-token work    # remove every entry for the name
+```
+
+- `set-token` prompts for the token in a terminal, without echoing it.
+  Otherwise it reads the first line of stdin:
+  `git-credential-ghpat set-token work < token.txt`.
+- `set-token work --token TOKEN` (or `--token=TOKEN`) takes the token from
+  the argument instead. This is convenient, but the token ends up in your
+  shell history and is visible in the process list while the command runs.
+- `set-token` replaces only the last entry for a name, the one that wins.
+  Earlier duplicates are left alone; a new name is appended.
+- `get-token` is for scripts, e.g.
+  `GH_TOKEN=$(git-credential-ghpat get-token work) gh pr list`
+- Edits keep all other lines as they are. The file is replaced atomically,
+  created readable only by you (`0600` in a `0700` directory on Linux), and a
+  symlink is written through rather than replaced.
+- `get-token` and `del-token` exit with status 1 if the name isn't listed;
+  bad arguments exit with status 2.
 
 ## Configure git
 
@@ -102,11 +129,11 @@ binaries for both as workflow artifacts.
 
 | Request | Result |
 |---|---|
-| identifier is in the map | `username=token`, `password=<PAT>` |
-| identifier not in the map, or no username | no output; the next helper answers |
+| identifier is in the file | `username=token`, `password=<PAT>` |
+| identifier not in the file, or no username | no output; the next helper answers |
 | identifier listed without a token | warning on stderr, no output |
-| map file missing | no output |
-| map file unreadable | warning on stderr, no output |
+| credentials file missing | no output |
+| credentials file unreadable | warning on stderr, no output |
 | `store` / `erase` | ignored; nothing is saved or deleted |
 
 Credential helpers only run for HTTPS remotes. SSH remotes authenticate with

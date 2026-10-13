@@ -41,8 +41,12 @@ impl Drop for TempDir {
 
 /// Run the helper with only the given path variables set.
 fn run(action: &str, input: &str, vars: &[(&str, &Path)]) -> Output {
+    run_args(&[action], input, vars)
+}
+
+fn run_args(args: &[&str], input: &str, vars: &[(&str, &Path)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_git-credential-ghpat"));
-    cmd.arg(action);
+    cmd.args(args);
     for var in PATH_VARS {
         cmd.env_remove(var);
     }
@@ -55,12 +59,10 @@ fn run(action: &str, input: &str, vars: &[(&str, &Path)]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // The helper may exit without reading stdin, e.g. on a usage error.
+    if let Err(e) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
+    }
     child.wait_with_output().unwrap()
 }
 
@@ -218,4 +220,236 @@ fn path_from_ghpat_file_wins() {
         &[("GHPAT_FILE", &map), ("XDG_CONFIG_HOME", &xdg)],
     );
     assert_eq!(password(&out), Some("TOK_FILE"));
+}
+
+/// Run a management subcommand against the table at map.
+fn cmd(args: &[&str], input: &str, map: &Path) -> Output {
+    run_args(args, input, &[("GHPAT_FILE", map)])
+}
+
+#[test]
+fn set_get_del_round_trip() {
+    let dir = TempDir::new("round-trip");
+    let map = dir.join("new-dir").join("credentials");
+
+    let out = cmd(&["set-token", "work"], "TOK1\n", &map);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&map).unwrap(), "work TOK1\n");
+
+    let out = cmd(&["get-token", "work"], "", &map);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "TOK1\n");
+
+    cmd(&["set-token", "side"], "TOK_SIDE", &map);
+    cmd(&["set-token", "work"], "  TOK2  \n", &map);
+    assert_eq!(
+        fs::read_to_string(&map).unwrap(),
+        "work TOK2\nside TOK_SIDE\n"
+    );
+    let out = helper("get", "username=work\n\n", &map);
+    assert_eq!(password(&out), Some("TOK2"));
+
+    let out = cmd(&["del-token", "work"], "", &map);
+    assert!(out.status.success());
+    assert_eq!(fs::read_to_string(&map).unwrap(), "side TOK_SIDE\n");
+
+    for args in [["get-token", "work"], ["del-token", "work"]] {
+        let out = cmd(&args, "", &map);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "");
+        assert!(stderr(&out).contains("no token for 'work'"));
+    }
+}
+
+#[test]
+fn get_and_del_on_missing_file_fail() {
+    let dir = TempDir::new("no-file");
+    let map = dir.join("credentials");
+    for command in ["get-token", "del-token"] {
+        let out = cmd(&[command, "work"], "", &map);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(stderr(&out).contains("no token for 'work'"));
+    }
+    assert!(!map.exists());
+}
+
+#[test]
+fn set_token_keeps_other_lines() {
+    let dir = TempDir::new("keep");
+    let map = dir.write("map", "\u{feff}# mine\r\nwork OLD\r\n\r\nside B\r\n");
+    let out = cmd(&["set-token", "work"], "NEW\r\n", &map);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&map).unwrap(),
+        "\u{feff}# mine\r\nwork NEW\r\n\r\nside B\r\n"
+    );
+}
+
+#[test]
+fn set_token_rejects_bad_tokens() {
+    let dir = TempDir::new("bad-token");
+    let map = dir.join("credentials");
+    for (input, message) in [
+        ("", "no token given"),
+        ("\n", "no token given"),
+        ("a b\n", "cannot contain whitespace"),
+    ] {
+        let out = cmd(&["set-token", "work"], input, &map);
+        assert_eq!(out.status.code(), Some(1), "{input:?}");
+        assert!(stderr(&out).contains(message), "{input:?}");
+    }
+    assert!(!map.exists());
+}
+
+#[test]
+fn bad_arguments_print_usage() {
+    let dir = TempDir::new("usage");
+    let map = dir.join("credentials");
+    for args in [
+        &[][..],
+        &["set-token"],
+        &["get-token", "a", "b"],
+        &["set-token", "#work"],
+        &["set-token", "a b"],
+        &["del-token", ""],
+        &["list-tokens", "work"],
+    ] {
+        let out = cmd(args, "TOK\n", &map);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(stdout(&out), "");
+        assert!(!stderr(&out).is_empty(), "{args:?}");
+    }
+    assert!(!map.exists());
+
+    let out = cmd(&["--help"], "", &map);
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("set-token"));
+}
+
+#[test]
+fn set_token_uses_default_path() {
+    let dir = TempDir::new("default-path");
+    let xdg = dir.join("xdg");
+    let out = run_args(
+        &["set-token", "work"],
+        "TOK\n",
+        &[("XDG_CONFIG_HOME", &xdg)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let map = xdg.join("git-credential-ghpat").join("credentials");
+    assert_eq!(fs::read_to_string(map).unwrap(), "work TOK\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn set_token_creates_private_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("private");
+    let map = dir.join("new-dir").join("credentials");
+    cmd(&["set-token", "work"], "TOK\n", &map);
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&map), 0o600);
+    assert_eq!(mode(map.parent().unwrap()), 0o700);
+
+    // Replacing a world-readable table tightens it.
+    let open = dir.write("open", "work OLD\n");
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+    cmd(&["set-token", "work"], "NEW\n", &open);
+    assert_eq!(mode(&open), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn set_token_writes_through_symlink() {
+    let dir = TempDir::new("symlink");
+    let target = dir.write("real", "work OLD\n");
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = cmd(&["set-token", "work"], "NEW\n", &link);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "work NEW\n");
+}
+
+#[test]
+fn set_token_leaves_no_temp_files() {
+    let dir = TempDir::new("no-temp");
+    let map = dir.join("credentials");
+    cmd(&["set-token", "work"], "TOK\n", &map);
+    cmd(&["del-token", "work"], "", &map);
+    let names: Vec<_> = fs::read_dir(&*dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["credentials"]);
+}
+
+#[test]
+fn list_tokens_prints_names_only() {
+    let dir = TempDir::new("list");
+    let map = dir.write("map", "# c\nwork A\nside B\nwork C\nbare\n");
+    let out = cmd(&["list-tokens"], "", &map);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "work\nside\nbare\n");
+
+    let out = cmd(&["list-tokens"], "", &dir.join("missing"));
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "");
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn set_token_replaces_only_the_last_entry() {
+    let dir = TempDir::new("last");
+    let map = dir.write("map", "work OLD1\nside B\nwork OLD2\n");
+    cmd(&["set-token", "work"], "NEW\n", &map);
+    assert_eq!(
+        fs::read_to_string(&map).unwrap(),
+        "work OLD1\nside B\nwork NEW\n"
+    );
+    let out = cmd(&["get-token", "work"], "", &map);
+    assert_eq!(stdout(&out), "NEW\n");
+}
+
+#[test]
+fn set_token_from_argument() {
+    let dir = TempDir::new("arg");
+    let map = dir.join("credentials");
+    // With --token, stdin is not read.
+    let out = cmd(
+        &["set-token", "work", "--token", "TOK_ARG"],
+        "TOK_STDIN\n",
+        &map,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = cmd(&["set-token", "--token=TOK_EQ", "side"], "", &map);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&map).unwrap(),
+        "work TOK_ARG\nside TOK_EQ\n"
+    );
+
+    for (token, message) in [("", "no token given"), ("a b", "cannot contain whitespace")] {
+        let out = cmd(&["set-token", "work", "--token", token], "", &map);
+        assert_eq!(out.status.code(), Some(1), "{token:?}");
+        assert!(stderr(&out).contains(message), "{token:?}");
+    }
+
+    for args in [
+        &["set-token", "work", "--token"][..],
+        &["get-token", "work", "--token", "T"],
+        &["del-token", "work", "--token=T"],
+    ] {
+        let out = cmd(args, "", &map);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(&map).unwrap(),
+        "work TOK_ARG\nside TOK_EQ\n"
+    );
 }
