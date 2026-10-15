@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -58,3 +59,67 @@ jobs:
           name: git-credential-ghpat-${{ matrix.target }}
           path: target/release/${{ matrix.exe }}
           if-no-files-found: error
+
+  # On a v* tag, package the binaries from the build jobs and create a draft
+  # release with them, for the release notes to be written and published by
+  # hand.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: git-credential-ghpat-*
+          path: artifacts
+
+      - name: Package
+        run: |
+          name=git-credential-ghpat-$GITHUB_REF_NAME
+          linux=artifacts/git-credential-ghpat-x86_64-unknown-linux-gnu
+          windows=artifacts/git-credential-ghpat-x86_64-pc-windows-msvc
+          # Artifacts don't keep the executable bit.
+          chmod 755 "$linux/git-credential-ghpat"
+          mkdir dist
+          tar -czf "dist/$name-x86_64-unknown-linux-gnu.tar.gz" -C "$linux" \
+            --owner=0 --group=0 git-credential-ghpat
+          (cd "$windows" && zip -X "../../dist/$name-x86_64-pc-windows-msvc.zip" \
+            git-credential-ghpat.exe)
+          (cd dist && sha256sum -- * > SHA256SUMS)
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          name=git-credential-ghpat-$GITHUB_REF_NAME
+          run_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          cat > notes.md <<EOF
+          ### Downloads
+
+          | Platform | Asset |
+          |---|---|
+          | Linux x86-64 (glibc) | \`$name-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Windows x86-64 | \`$name-x86_64-pc-windows-msvc.zip\` |
+
+          Put \`git-credential-ghpat\` (\`.exe\` on Windows) on your \`PATH\`, then see the README for the git configuration. Verify downloads with \`sha256sum -c SHA256SUMS\`.
+
+          Binaries were built by [CI run $GITHUB_RUN_ID]($run_url) from this tag's commit.
+          EOF
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md dist/*
