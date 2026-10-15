@@ -1,8 +1,8 @@
 [package]
 name = "git-credential-ghpat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Git credential helper that picks a GitHub PAT by identifier"
+description = "Git credential helper that picks a GitHub PAT by user, owner, or repo"
 license = "MIT"
 repository = "https://github.com/atagent/git-credential-ghpat"
 

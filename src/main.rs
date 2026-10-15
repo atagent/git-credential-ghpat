@@ -1,13 +1,16 @@
 //! git-credential-ghpat: git credential helper that picks a GitHub PAT by
-//! identifier. Git sends the identifier as the username; the helper looks it
-//! up in a credentials table and answers with the PAT, rewriting the
-//! username to "token" so the identifier never reaches GitHub.
+//! pattern. Git sends a username (the profile) and, with
+//! credential.useHttpPath, the repo path; the helper finds the last matching
+//! `[profile@][owner[/repo]]` entry in a credentials table and answers with
+//! its PAT, rewriting the username to "token" so the profile never reaches
+//! GitHub.
 //!
 //! The table is $GHPAT_FILE, or credentials in the config directory (see
 //! get_ghpat_path). It is managed with the list-tokens, get-token,
 //! set-token, and del-token subcommands; see table.rs for the format.
 //!
-//! Unknown identifiers produce no output, so the next helper can answer.
+//! Requests that match no entry produce no output, so the next helper can
+//! answer.
 
 mod table;
 
@@ -23,9 +26,11 @@ const USERNAME: &str = "token";
 
 const USAGE: &str = "\
 usage: git-credential-ghpat list-tokens
-       git-credential-ghpat get-token <name>
-       git-credential-ghpat set-token <name> [--token <token>]
-       git-credential-ghpat del-token <name>
+       git-credential-ghpat get-token <pattern>
+       git-credential-ghpat set-token <pattern> [--token <token>]
+       git-credential-ghpat del-token <pattern>
+
+A pattern is [profile@][owner[/repo]], e.g. work@, acme, or work@acme/api.
 
 Without --token, set-token prompts for the token in a terminal, without
 echoing it, and otherwise reads it from stdin. --token puts the token in
@@ -65,35 +70,52 @@ fn get_ghpat_path() -> Option<PathBuf> {
     Some(config_dir()?.join(PROG).join("credentials"))
 }
 
-/// Return the username from git's key=value lines, up to the blank line that
-/// ends them, or None if there is none. The last one wins.
-fn read_username(input: impl BufRead) -> io::Result<Option<String>> {
-    let mut username = None;
+/// The parts of git's request that patterns match on.
+#[derive(Debug, Default, PartialEq)]
+struct Request {
+    username: Option<String>,
+    path: Option<String>,
+}
+
+/// Return the username and path from git's key=value lines, up to the blank
+/// line that ends them. The last of each wins.
+fn read_request(input: impl BufRead) -> io::Result<Request> {
+    let mut request = Request::default();
+    let value = |value: &[u8]| Some(String::from_utf8_lossy(value).into_owned());
     for line in input.split(b'\n') {
         let line = line?;
         let line = line.strip_suffix(b"\r").unwrap_or(&line);
         if line.is_empty() {
             break;
         }
-        if let Some(value) = line.strip_prefix(b"username=") {
-            username = Some(String::from_utf8_lossy(value).into_owned());
+        if let Some(username) = line.strip_prefix(b"username=") {
+            request.username = value(username);
+        } else if let Some(path) = line.strip_prefix(b"path=") {
+            request.path = value(path);
         }
     }
-    Ok(username)
+    Ok(request)
+}
+
+/// Warn about entries whose pattern doesn't parse, since they never match.
+fn warn_invalid(contents: &str, path: &Path) {
+    for pattern in table::invalid(contents) {
+        eprintln!(
+            "{PROG}: invalid pattern '{pattern}' in {}, ignored",
+            path.display()
+        );
+    }
 }
 
 /// The credential helper side: answer git's "get", ignore everything else.
 /// Problems are reported on stderr but never fail, so the next helper can
 /// still answer.
 fn helper(action: &str) -> io::Result<()> {
-    let user = read_username(io::stdin().lock())?;
+    let request = read_request(io::stdin().lock())?;
     // Nothing is saved, so only "get" has work to do.
     if action != "get" {
         return Ok(());
     }
-    let Some(user) = user.filter(|user| !user.is_empty()) else {
-        return Ok(());
-    };
     let Some(path) = get_ghpat_path() else {
         return Ok(());
     };
@@ -107,10 +129,16 @@ fn helper(action: &str) -> io::Result<()> {
         }
     };
 
-    match table::find(&contents, &user) {
+    warn_invalid(&contents, &path);
+    let found = table::lookup(
+        &contents,
+        request.username.as_deref(),
+        request.path.as_deref(),
+    );
+    match found {
         None => {}
-        Some("") => eprintln!("{PROG}: no token for '{user}' in {}", path.display()),
-        Some(token) => write!(
+        Some((pattern, "")) => eprintln!("{PROG}: {}", no_token(pattern, &path)),
+        Some((_, token)) => write!(
             io::stdout().lock(),
             "username={USERNAME}\npassword={token}\n"
         )?,
@@ -201,6 +229,7 @@ fn read_token(name: &str) -> io::Result<String> {
 fn list_tokens() -> Result<(), String> {
     let path = table_path()?;
     let contents = read_table(&path)?;
+    warn_invalid(&contents, &path);
     let mut stdout = io::stdout().lock();
     for name in table::names(&contents) {
         writeln!(stdout, "{name}").map_err(|e| e.to_string())?;
@@ -248,7 +277,7 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-/// The <name> and, if allowed, the --token value from a subcommand's
+/// The <pattern> and, if allowed, the --token value from a subcommand's
 /// arguments, or None if they don't parse.
 fn parse_name_args(args: &[OsString], allow_token: bool) -> Option<(&str, Option<&str>)> {
     let mut name = None;
@@ -292,8 +321,8 @@ fn main() -> ExitCode {
             let Some((name, token)) = parse_name_args(&args[1..], command == "set-token") else {
                 return usage();
             };
-            if !table::valid_name(name) {
-                eprintln!("{PROG}: a name must be one word that doesn't start with '#'");
+            if !table::valid_pattern(name) {
+                eprintln!("{PROG}: invalid pattern '{name}'; expected [profile@][owner[/repo]]");
                 return ExitCode::from(2);
             }
             match command {
@@ -359,21 +388,35 @@ mod tests {
         assert_eq!(parse(&["work", "--token=T"], false), None);
     }
 
-    #[test]
-    fn username_last_one_wins() {
-        let input = b"protocol=https\nusername=a\nusername=b\n\nusername=c\n";
-        assert_eq!(read_username(&input[..]).unwrap().as_deref(), Some("b"));
+    fn request(username: Option<&str>, path: Option<&str>) -> Request {
+        Request {
+            username: username.map(str::to_owned),
+            path: path.map(str::to_owned),
+        }
     }
 
     #[test]
-    fn username_accepts_crlf_and_missing_blank_line() {
-        let input = b"host=github.com\r\nusername=work\r\n";
-        assert_eq!(read_username(&input[..]).unwrap().as_deref(), Some("work"));
+    fn request_last_one_wins() {
+        let input =
+            b"protocol=https\nusername=a\npath=x/y\nusername=b\npath=o/r.git\n\nusername=c\n";
+        assert_eq!(
+            read_request(&input[..]).unwrap(),
+            request(Some("b"), Some("o/r.git"))
+        );
     }
 
     #[test]
-    fn username_ignores_other_keys() {
-        let input = b"path=a=b\npassword=username=x\n\n";
-        assert_eq!(read_username(&input[..]).unwrap(), None);
+    fn request_accepts_crlf_and_missing_blank_line() {
+        let input = b"host=github.com\r\nusername=work\r\npath=o/r\r\n";
+        assert_eq!(
+            read_request(&input[..]).unwrap(),
+            request(Some("work"), Some("o/r"))
+        );
+    }
+
+    #[test]
+    fn request_ignores_other_keys() {
+        let input = b"wwwauth[]=path=a\npassword=username=x\n\n";
+        assert_eq!(read_request(&input[..]).unwrap(), request(None, None));
     }
 }

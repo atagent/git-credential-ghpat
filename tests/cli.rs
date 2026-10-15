@@ -4,7 +4,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const MAP: &str = "work TOK_WORK\nside\nwork TOK_DUP\n";
+const MAP: &str = "work@ TOK_WORK\nside@\nwork@ TOK_DUP\n";
 const PATH_VARS: [&str; 4] = ["GHPAT_FILE", "XDG_CONFIG_HOME", "HOME", "APPDATA"];
 
 /// A per-test temp directory, removed on drop.
@@ -85,7 +85,7 @@ fn password(output: &Output) -> Option<&str> {
 }
 
 #[test]
-fn get_known_identifier() {
+fn get_known_profile() {
     let dir = TempDir::new("known");
     let map = dir.write("map", MAP);
     let out = helper(
@@ -120,7 +120,7 @@ fn get_identifier_without_token_warns() {
     let out = helper("get", "username=side\n\n", &map);
     assert!(out.status.success());
     assert_eq!(stdout(&out), "");
-    assert!(stderr(&out).contains("no token for 'side'"));
+    assert!(stderr(&out).contains("no token for 'side@'"));
 }
 
 #[test]
@@ -161,14 +161,14 @@ fn fallback(dir: &TempDir, token: &str) -> (&'static str, PathBuf) {
         let base = dir.join("appdata");
         dir.write(
             "appdata/git-credential-ghpat/credentials",
-            &format!("work {token}\n"),
+            &format!("work@ {token}\n"),
         );
         ("APPDATA", base)
     } else {
         let base = dir.join("home");
         dir.write(
             "home/.config/git-credential-ghpat/credentials",
-            &format!("work {token}\n"),
+            &format!("work@ {token}\n"),
         );
         ("HOME", base)
     }
@@ -177,7 +177,7 @@ fn fallback(dir: &TempDir, token: &str) -> (&'static str, PathBuf) {
 #[test]
 fn path_from_xdg_config_home() {
     let dir = TempDir::new("xdg");
-    dir.write("xdg/git-credential-ghpat/credentials", "work TOK_XDG\n");
+    dir.write("xdg/git-credential-ghpat/credentials", "work@ TOK_XDG\n");
     let (var, base) = fallback(&dir, "TOK_FALLBACK");
     let xdg = dir.join("xdg");
     let out = run(
@@ -211,8 +211,8 @@ fn path_ignores_relative_xdg_config_home() {
 #[test]
 fn path_from_ghpat_file_wins() {
     let dir = TempDir::new("override");
-    let map = dir.write("map", "work TOK_FILE\n");
-    dir.write("xdg/git-credential-ghpat/credentials", "work TOK_XDG\n");
+    let map = dir.write("map", "work@ TOK_FILE\n");
+    dir.write("xdg/git-credential-ghpat/credentials", "work@ TOK_XDG\n");
     let xdg = dir.join("xdg");
     let out = run(
         "get",
@@ -232,32 +232,32 @@ fn set_get_del_round_trip() {
     let dir = TempDir::new("round-trip");
     let map = dir.join("new-dir").join("credentials");
 
-    let out = cmd(&["set-token", "work"], "TOK1\n", &map);
+    let out = cmd(&["set-token", "work@"], "TOK1\n", &map);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(fs::read_to_string(&map).unwrap(), "work TOK1\n");
+    assert_eq!(fs::read_to_string(&map).unwrap(), "work@ TOK1\n");
 
-    let out = cmd(&["get-token", "work"], "", &map);
+    let out = cmd(&["get-token", "work@"], "", &map);
     assert!(out.status.success());
     assert_eq!(stdout(&out), "TOK1\n");
 
     cmd(&["set-token", "side"], "TOK_SIDE", &map);
-    cmd(&["set-token", "work"], "  TOK2  \n", &map);
+    cmd(&["set-token", "work@"], "  TOK2  \n", &map);
     assert_eq!(
         fs::read_to_string(&map).unwrap(),
-        "work TOK2\nside TOK_SIDE\n"
+        "work@ TOK2\nside TOK_SIDE\n"
     );
     let out = helper("get", "username=work\n\n", &map);
     assert_eq!(password(&out), Some("TOK2"));
 
-    let out = cmd(&["del-token", "work"], "", &map);
+    let out = cmd(&["del-token", "work@"], "", &map);
     assert!(out.status.success());
     assert_eq!(fs::read_to_string(&map).unwrap(), "side TOK_SIDE\n");
 
-    for args in [["get-token", "work"], ["del-token", "work"]] {
+    for args in [["get-token", "work@"], ["del-token", "work@"]] {
         let out = cmd(&args, "", &map);
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(stdout(&out), "");
-        assert!(stderr(&out).contains("no token for 'work'"));
+        assert!(stderr(&out).contains("no token for 'work@'"));
     }
 }
 
@@ -312,6 +312,10 @@ fn bad_arguments_print_usage() {
         &["set-token", "#work"],
         &["set-token", "a b"],
         &["del-token", ""],
+        &["set-token", "/repo"],
+        &["set-token", "owner/"],
+        &["get-token", "a/b/c"],
+        &["del-token", "a@b@c"],
         &["list-tokens", "work"],
     ] {
         let out = cmd(args, "TOK\n", &map);
@@ -452,4 +456,56 @@ fn set_token_from_argument() {
         fs::read_to_string(&map).unwrap(),
         "work TOK_ARG\nside TOK_EQ\n"
     );
+}
+
+#[test]
+fn get_by_owner_and_repo() {
+    let dir = TempDir::new("owner-repo");
+    let map = dir.write(
+        "map",
+        "work@ TOK_WORK\nacme TOK_ACME\nacme/api TOK_API\n@other TOK_OTHER\n",
+    );
+    for (input, token) in [
+        ("username=work\npath=acme/web.git\n\n", Some("TOK_ACME")),
+        ("username=work\npath=Acme/API.git\n\n", Some("TOK_API")),
+        ("path=acme/api.git/info/lfs\n\n", Some("TOK_API")),
+        ("path=other/x\n\n", Some("TOK_OTHER")),
+        ("username=work\npath=else/x\n\n", Some("TOK_WORK")),
+        // Without a path, owner rules never match.
+        ("username=work\n\n", Some("TOK_WORK")),
+        ("path=else/x\n\n", None),
+        ("host=github.com\n\n", None),
+    ] {
+        let out = helper("get", input, &map);
+        assert!(out.status.success());
+        assert_eq!(password(&out), token, "{input:?}");
+        assert_eq!(stderr(&out), "", "{input:?}");
+    }
+}
+
+#[test]
+fn get_matches_any_request_with_at() {
+    let dir = TempDir::new("catch-all");
+    let map = dir.write("map", "work@ TOK_WORK\n@ TOK_ANY\n");
+    for input in ["\n", "username=work\npath=acme/api\n\n"] {
+        let out = helper("get", input, &map);
+        assert_eq!(password(&out), Some("TOK_ANY"), "{input:?}");
+    }
+}
+
+#[test]
+fn invalid_patterns_warn_and_are_skipped() {
+    let dir = TempDir::new("invalid");
+    let map = dir.write("map", "work@ TOK_WORK\n/api TOK_BAD\nacme/ TOK_BAD\n");
+    let out = helper("get", "username=work\npath=acme/api\n\n", &map);
+    assert!(out.status.success());
+    assert_eq!(password(&out), Some("TOK_WORK"));
+    let err = stderr(&out);
+    assert!(err.contains("invalid pattern '/api'"), "{err}");
+    assert!(err.contains("invalid pattern 'acme/'"), "{err}");
+
+    let out = cmd(&["list-tokens"], "", &map);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "work@\n/api\nacme/\n");
+    assert!(stderr(&out).contains("invalid pattern '/api'"));
 }
