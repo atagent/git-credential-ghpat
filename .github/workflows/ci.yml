@@ -117,7 +117,7 @@ jobs:
           | Linux x86-64 (glibc) | \`$name-x86_64-unknown-linux-gnu.tar.gz\` |
           | Windows x86-64 | \`$name-x86_64-pc-windows-msvc.zip\` |
 
-          Put \`git-credential-ghpat\` (\`.exe\` on Windows) on your \`PATH\`, then see the README for the git configuration. Verify downloads with \`sha256sum -c SHA256SUMS\`.
+          Put \`git-credential-ghpat\` (\`.exe\` on Windows) on your \`PATH\`, then see the README for the git configuration. Verify downloads with \`sha256sum --ignore-missing -c SHA256SUMS\`.
 
           Binaries were built by [CI run $GITHUB_RUN_ID]($run_url) from this tag's commit.
           EOF
